@@ -46,4 +46,4 @@ estimated_fdr = 2 * rejection_prob
 standard_error = 2 * np.sqrt(rejection_prob * (1 - rejection_prob) / M)
 
 # Print results
-print(f"Estimated FDR: {estimated_fdr:.4f} ± {standard_error:.4f} (SE)")
+print(f"Estimated FDR: {estimated_fdr:.4f} alpha ± {standard_error:.4f} alpha (SE)")
