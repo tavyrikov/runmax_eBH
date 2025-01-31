@@ -1,280 +1,145 @@
-import pandas as pd
 import numpy as np
-import scipy
+import scipy.stats as stats
+import multiprocessing
 import matplotlib.pyplot as plt
-
 from scipy.stats import random_correlation
 
+# Set matplotlib style
 plt.style.use(['ggplot'])
-plt.rcParams["figure.figsize"] = (20, 10)
-plt.rcParams["figure.dpi"] = 150
 
-alpha = 0.05
-ntrue=100
-nfalse=100
-n = ntrue+nfalse
+# Simulation parameters
+ALPHA = 0.05  # False Discovery Rate threshold
+N_TRUE = 100   # Number of true null hypotheses
+N_FALSE = 100  # Number of false null hypotheses
+N = N_TRUE + N_FALSE  # Total number of hypotheses
+M = 100000  # Number of simulations
+T = 2000  # Number of time steps
 
-M = 10000
-T = 2000
 
-import multiprocessing
-
-def unpacking_apply_along_axis(all_args):
-    """…"""
-    (func1d, axis, arr, args, kwargs) = all_args
-    return np.apply_along_axis(func1d, axis, arr, *args, **kwargs)
-
-def parallel_apply_along_axis(func1d, axis, arr, *args, **kwargs):
+def generate_correlation_matrix(n):
     """
-    Like numpy.apply_along_axis(), but takes advantage of multiple
-    cores.
-    """        
-    # Effective axis where apply_along_axis() will be applied by each
-    # worker (any non-zero axis number would work, so as to allow the use
-    # of `np.array_split()`, which is only done on axis 0):
-    effective_axis = 1 if axis == 0 else axis
-    if effective_axis != axis:
-        arr = arr.swapaxes(axis, effective_axis)
-
-    # Chunks for the mapping (only a few chunks):
-    chunks = [(func1d, effective_axis, sub_arr, args, kwargs)
-              for sub_arr in np.array_split(arr, 5)]
-
-    pool = multiprocessing.Pool()
-    individual_results = pool.map(unpacking_apply_along_axis, chunks)
-    # Freeing the workers:
-    pool.close()
-    pool.join()
-
-    return np.concatenate(individual_results)
-
-for simi in range(1):
-    print("Iteration ", simi)
-
-    
+    Generate a random correlation matrix using an exponential distribution.
+    """
     rng = np.random.default_rng()
-    ev = np.random.exponential(size = n)
+    ev = np.random.exponential(size=n)
     ev = n * ev / np.sum(ev)
-    sigma = random_correlation.rvs(ev, random_state=rng)
+    return random_correlation.rvs(ev, random_state=rng)
 
-    mean_true = 0.0
-    mean_false = 0.1
+
+def bayes_factor(x, mean_true, mean_false, sigma):
+    """
+    Compute the Bayes Factor for sequential hypothesis testing.
+    """
+    return stats.norm(mean_false, sigma).pdf(x) / stats.norm(mean_true, sigma).pdf(x)
+
+
+def ebh_procedure(e_values, true_flags):
+    """
+    Apply the Benjamini-Hochberg based on e-values (eBH) procedure to control FDR.
+    """
+    sorted_indices = np.argsort(e_values)[::-1]
+    sorted_e_values = e_values[sorted_indices]
+    sorted_true_flags = true_flags[sorted_indices]
+    
+    rejected = np.max(np.where(sorted_e_values >= N / ((1.0 + np.arange(N)) * ALPHA), 1 + np.arange(N), 0))
+    
+    fdr = 0 if rejected == 0 else np.sum(sorted_true_flags[:rejected]) / rejected
+    power = 0 if rejected == 0 else np.sum(1 - sorted_true_flags[:rejected]) / np.sum(1 - sorted_true_flags)
+    
+    return fdr, power, rejected
+
+
+def simulate_experiment(i, mean_true, mean_false, sigma, marg_sigma, true_flags):
+    """
+    Run a single simulation of sequential hypothesis testing with four different strategies.
+    """
+    np.random.seed(2 * T * i + 72346)
+    
+    # Generate correlated normal data
+    X = np.random.multivariate_normal(mean=[mean_true] * N_TRUE + [mean_false] * N_FALSE, cov=sigma, size=T).T
+    
+    # Compute e-values using the Bayes Factor
+    E = bayes_factor(X, mean_true, mean_false, marg_sigma)
+    E_cumulative = np.cumprod(E, axis=1)
+    cmax_Ep = np.maximum.accumulate(E_cumulative, axis=1)
+    
+    # Initialize result arrays for four different testing strategies
+    fdr_results, power_results, rejected_results = np.zeros((4, T)), np.zeros((4, T)), np.zeros((4, T))
+    
+    for t in range(T):
+        fdr_results[0, t], power_results[0, t], rejected_results[0, t] = ebh_procedure(E[:, t], true_flags)
+        fdr_results[1, t], power_results[1, t], rejected_results[1, t] = ebh_procedure(cmax_Ep[:, t], true_flags)
+        normEpmax1 = (cmax_Ep[:, t] - 1.0 - np.log(cmax_Ep[:, t])) / (np.log(cmax_Ep[:, t])**2)
+        fdr_results[2, t], power_results[2, t], rejected_results[2, t] = ebh_procedure(normEpmax1, true_flags)
+        normEpmax2 = np.sqrt(cmax_Ep[:, t]) - 1
+        fdr_results[3, t], power_results[3, t], rejected_results[3, t] = ebh_procedure(normEpmax2, true_flags)
+    
+    return fdr_results, power_results, rejected_results
+
+
+def run_simulations():
+    """
+    Run multiple simulations in parallel using multiprocessing.
+    """
+    sigma = generate_correlation_matrix(N)
     marg_sigma = np.mean(np.diag(sigma))
-    print('mean_true ', mean_true)
-    print('mean_false ', mean_false)
-    print('marg_sigma ', marg_sigma)
-
-    true_flag = np.array([1]*ntrue+[0]*nfalse)
+    true_flags = np.array([1] * N_TRUE + [0] * N_FALSE)
     
-    def simulate(i):
-        np.random.seed(2*T*i+72346)
+    # Run simulations in parallel
+    with multiprocessing.Pool(20) as pool:
+        results = pool.starmap(simulate_experiment, [(i, 0.0, 0.1, sigma, marg_sigma, true_flags) for i in range(M)])
+    
+    # Aggregate result
+    
+    fdr_values, power_values, rejected_values = zip(*results)
+    
         
-        X = np.random.multivariate_normal(mean=[mean_true]*ntrue+[mean_false]*nfalse, cov=sigma, size=T).T
-        E = scipy.stats.norm(mean_false, marg_sigma).pdf(X) / scipy.stats.norm(mean_true, marg_sigma).pdf(X)
-        Ep = np.cumprod(E, axis = 1)
+    fdr_mean = np.mean(np.stack(fdr_values), axis=0)
+    supfdr_mean = np.mean(np.maximum.accumulate(np.stack(fdr_values), axis=2), axis=0)
+    power_mean = np.mean(np.stack(power_values), axis=0)
+    rejected_mean = np.mean(np.stack(rejected_values), axis=0)
+    
+    return fdr_mean, supfdr_mean, power_mean, rejected_mean
 
-        if i == 0:
-            print('mean E', np.mean(E[:ntrue, :]))
 
-        def BH(E, true_flag):
-            true_flag = true_flag.copy()
-            true_flag = true_flag[np.argsort(E)[::-1]]
-            E = E[np.argsort(E)[::-1]]
-            rejected = np.max(np.where(E >= n/((1.0+np.arange(n)) * alpha), 1+np.arange(n), 0))
-
-            if rejected == 0:
-                fdr = 0
-            else:
-                fdr = np.sum(true_flag[:rejected])*1.0 / rejected
-
-            if rejected == 0:
-                power = 0
-            else:
-                power = np.sum(1 - true_flag[:rejected])*1.0 / np.sum(1 - true_flag)
-
-            return fdr, power, rejected
-
-        cmaxEp = np.maximum.accumulate(Ep, axis = 1)
+def plot_results(fdr, supfdr, power, rejected):
+    """
+    Plot the simulation results for the four different strategies.
+    """
+    labels = ['eBH', 'Running Maximum eBH', 'Adjusted (1) Running Maximum eBH', 'Adjusted (2) Running Maximum eBH']
+    # colors = ['r', 'b', 'g', 'purple']
+    
+    plt.figure(figsize=(12, 6))
+    
+    for i in range(4):
+        plt.subplot(1, 3, 1)
+        plt.axhline(y=ALPHA, linestyle='-', color='g')
+        plt.plot(fdr[i], label=labels[i])#, color=colors[i])
+        plt.title('False Discovery Rate')
+        plt.xlabel('Time')
+        plt.ylabel('FDR')
+        plt.legend(bbox_to_anchor=(1.01, 0.85))
+    
+        plt.subplot(1, 3, 2)
+        plt.plot(supfdr[i], label=labels[i])#, color=colors[i])
+        plt.title('supFDR Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Rejected')
+        # plt.legend()
         
-        fdr1, fdr2, fdr3, fdr4  = np.zeros(T), np.zeros(T), np.zeros(T), np.zeros(T)
-        power1, power2, power3, power4 = np.zeros(T), np.zeros(T), np.zeros(T), np.zeros(T)
-        rejected1, rejected2, rejected3, rejected4 = np.zeros(T), np.zeros(T), np.zeros(T), np.zeros(T)
-        globe1, globe2, globe3, globe4 = np.zeros(T), np.zeros(T), np.zeros(T), np.zeros(T)
-
-        prev_record = n
-        for t in range(T):
-            max_i = np.argmax(E[:, t])
-            if E[max_i, t] > n / (prev_record * alpha):
-                E[max_i, t:] = E[max_i, t]
-                prev_record -= 1
-
-            res = BH(E[:, t], true_flag)
-            
-            fdr1[t] = res[0]
-            power1[t] = res[1]
-            rejected1[t] = res[2]
-            if np.sum(E[:, t]) >= n/alpha:
-                globe1[t] = 1 
-            else:
-                globe1[t] = 0 
-            
-        
-            res = BH(cmaxEp[:, t], true_flag)
-            fdr2[t] = res[0]
-            power2[t] = res[1]
-            rejected2[t] = res[2]
-            if np.sum(cmaxEp[:, t]) >= n/alpha:
-                globe2[t] = 1 
-            else:
-                globe2[t] = 0
-            
-            Epmax = cmaxEp[:, t].copy()
-            
-            normEpmax1 = (Epmax - 1.0 - np.log(Epmax)) / (np.log(Epmax)*np.log(Epmax))
-            res =  BH(normEpmax1, true_flag)
-            fdr3[t] = res[0]
-            power3[t] = res[1]
-            rejected3[t] = res[2]
-            if np.sum(normEpmax1) >= n/alpha:
-                globe3[t] = 1 
-            else:
-                globe3[t] = 0
-                
-            normEpmax2 = np.sqrt(Epmax) - 1
-            res =  BH(normEpmax2, true_flag)
-            fdr4[t] = res[0]
-            power4[t] = res[1]
-            rejected4[t] = res[2]
-            if np.sum(normEpmax2) >= n/alpha:
-                globe4[t] = 1 
-            else:
-                globe4[t] = 0
-                    
-        return fdr1, fdr2, fdr3, fdr4, power1, power2, power3, power4, rejected1, rejected2, rejected3, rejected4, globe1, globe2, globe3, globe4
-
-        
-    pool = multiprocessing.Pool(20)
-    fdr1, fdr2, fdr3, fdr4, power1, power2, power3, power4, rejected1, rejected2, rejected3, rejected4, globe1, globe2, globe3, globe4 = zip(*pool.map(simulate, range(0, M)))
-
-    fdr1 = np.vstack(fdr1)
-    supfdr1 = np.maximum.accumulate(fdr1, axis=1)
-    power1 = np.vstack(power1)
-    rejected1 = np.vstack(rejected1)
-    globe1 = np.vstack(globe1)
-       
-    fdr1 = np.mean(fdr1, axis=0)
-    supfdr1 = np.mean(supfdr1, axis=0)
-    power1 = np.mean(power1, axis=0)
-    rejected1 = np.mean(rejected1, axis=0)
-    globe1 = np.mean(globe1, axis=0)
+        plt.subplot(1, 3, 3)
+        plt.plot(power[i], label=labels[i])#, color=colors[i])
+        plt.title('Power Over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Power')
+        # plt.legend()
     
-    
-    fdr2 = np.vstack(fdr2)
-    supfdr2 = np.maximum.accumulate(fdr2, axis=1)
-    power2 = np.vstack(power2)
-    rejected2 = np.vstack(rejected2)
-    globe2 = np.vstack(globe2)
-       
-    fdr2 = np.mean(fdr2, axis=0)
-    supfdr2 = np.mean(supfdr2, axis=0)
-    power2 = np.mean(power2, axis=0)
-    rejected2 = np.mean(rejected2, axis=0)
-    globe2 = np.mean(globe2, axis=0)
-    
-    
-    fdr3 = np.vstack(fdr3)
-    supfdr3 = np.maximum.accumulate(fdr3, axis=1)
-    power3 = np.vstack(power3)
-    rejected3 = np.vstack(rejected3)
-    globe3 = np.vstack(globe3)
-       
-    fdr3 = np.mean(fdr3, axis=0)
-    supfdr3 = np.mean(supfdr3, axis=0)
-    power3 = np.mean(power3, axis=0)
-    rejected3 = np.mean(rejected3, axis=0)
-    globe3 = np.mean(globe3, axis=0)
-    
-    
-    fdr4 = np.vstack(fdr4)
-    supfdr4 = np.maximum.accumulate(fdr4, axis=1)
-    power4 = np.vstack(power4)
-    rejected4 = np.vstack(rejected4)
-    globe4 = np.vstack(globe4)
-       
-    fdr4 = np.mean(fdr4, axis=0)
-    supfdr4 = np.mean(supfdr4, axis=0)
-    power4 = np.mean(power4, axis=0)
-    rejected4 = np.mean(rejected4, axis=0)
-    globe4 = np.mean(globe4, axis=0)
-
-    plt.rcParams["figure.figsize"] = (20,10)
-    fig, axes = plt.subplots(2, 3, constrained_layout=True)
-    
-    axes[0,0].axhline(y=alpha, linestyle='-', color='g')
-    
-    axes[0,0].plot(np.arange(T), fdr1, label='eBH')
-    axes[0,0].plot(np.arange(T), fdr2, label='cumulative maximum eBH')
-    axes[0,0].plot(np.arange(T), fdr3, label='adjusted(1) running maximum eBH')
-    axes[0,0].plot(np.arange(T), fdr4, label='adjusted(2) running maximum eBH')
-        
-    axes[0,0].set_title('FDR', fontsize=15)
-    axes[0,0].set_xlabel('Time', fontsize=15)
-    axes[0,0].set_ylabel('FDR', fontsize=15) 
-    axes[0,0].tick_params(axis='both', which='major', labelsize=10)
-    axes[0,0].tick_params(axis='both', which='minor', labelsize=8)
-    
-    axes[0,1].axhline(y=alpha, linestyle='-', color='g')
-    
-    axes[0,1].plot(np.arange(T), supfdr1, label='eBH')
-    axes[0,1].plot(np.arange(T), supfdr2, label='cumulative maximum eBH')
-    axes[0,1].plot(np.arange(T), supfdr3, label='adjusted(1) running maximum eBH')
-    axes[0,1].plot(np.arange(T), supfdr4, label='adjusted(2) running maximum eBH')
-        
-    axes[0,1].set_title('supFDR', fontsize=15)
-    axes[0,1].set_xlabel('Time', fontsize=15)
-    axes[0,1].set_ylabel('supFDR', fontsize=15) 
-    axes[0,1].tick_params(axis='both', which='major', labelsize=10)
-    axes[0,1].tick_params(axis='both', which='minor', labelsize=8)
-    
-    axes[0,2].plot(np.arange(T), globe1, label='eBH')
-    axes[0,2].plot(np.arange(T), globe2, label='cumulative maximum eBH')
-    axes[0,2].plot(np.arange(T), globe3, label='adjusted(1) running maximum eBH')
-    axes[0,2].plot(np.arange(T), globe4, label='adjusted(2) running maximum eBH')
-        
-    axes[0,2].set_title('Global Error Type 1', fontsize=15)
-    axes[0,2].set_xlabel('Time', fontsize=15)
-    axes[0,2].set_ylabel('Global Error Type 1', fontsize=15) 
-    axes[0,2].tick_params(axis='both', which='major', labelsize=10)
-    axes[0,2].tick_params(axis='both', which='minor', labelsize=8)
-        
-    axes[1,0].plot(np.arange(T), power1, label='eBH')
-    axes[1,0].plot(np.arange(T), power2, label='cumulative maximum eBH')
-    axes[1,0].plot(np.arange(T), power3, label='adjusted(1) running maximum eBH')
-    axes[1,0].plot(np.arange(T), power4, label='adjusted(2) running maximum eBH')
-        
-    axes[1,0].set_title('Power', fontsize=15)
-    axes[1,0].set_xlabel('Time', fontsize=15)
-    axes[1,0].set_ylabel('Power', fontsize=15) 
-    axes[1,0].tick_params(axis='both', which='major', labelsize=10)
-    axes[1,0].tick_params(axis='both', which='minor', labelsize=8)
-        
-    axes[1,1].plot(np.arange(T), rejected1, label='eBH')
-    axes[1,1].plot(np.arange(T), rejected2, label='cumulative maximum eBH')
-    axes[1,1].plot(np.arange(T), rejected3, label='adjusted(1) running maximum eBH')
-    axes[1,1].plot(np.arange(T), rejected4, label='adjusted(2) running maximum eBH')
-        
-    axes[1,1].set_title('Rejected', fontsize=15)
-    axes[1,1].set_xlabel('Time', fontsize=15)
-    axes[1,1].set_ylabel('Rejected', fontsize=15) 
-    axes[1,1].tick_params(axis='both', which='major', labelsize=10)
-    axes[1,1].tick_params(axis='both', which='minor', labelsize=8)
-
-    lines_labels = [ax.get_legend_handles_labels() for ax in fig.axes[:1]]
-    lines, labels = [sum(lol, []) for lol in zip(*lines_labels)]
-
-    axes[1,2].remove()
-
-    fig.legend(lines, labels, loc='lower right', ncol=1, fontsize=15, bbox_to_anchor=(0.99, 0.3))
-
-    plt.savefig(f'sim2.png')
+    plt.tight_layout()
+    plt.savefig(f'sim4.png')
     plt.show()
+
+# Run the simulation
+fdr_results, supfd_results, power_results, rejected_results = run_simulations()
+
+# Plot results
+plot_results(fdr_results, supfd_results, power_results, rejected_results)
